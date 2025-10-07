@@ -1,124 +1,158 @@
-from langchain.prompts import PromptTemplate
+from system_prompts import (
+    VALIDATION_DECISION_PROMPT,
+    BIAS_DETECTION_PROMPT,
+    CLAIM_VALIDATION_PROMPT,
+    FINAL_ACTION_PROMPT,
+    SYSTEM_CONFIG
+)
 import re
+import json
+from cachetools import TTLCache
 
 class CredibilityAnalyzer:
     def __init__(self, llm):
         self.llm = llm
-        self.source_weights = {
-            'academic': 1.0,
-            'news': 0.8,
-            'government': 0.9,
-            'corporate': 0.5,
-            'blog': 0.4,
-            'social': 0.3,
-            'commercial': 0.3
-        }
+        self.weights = SYSTEM_CONFIG['source_weights']
+        self.cache = TTLCache(maxsize=1000, ttl=7200)
     
     def score_claim(self, claim_text, source_type, context):
-        """Score a claim's credibility (0-10)"""
-        # Base score from source type
-        base_score = self.source_weights.get(source_type, 0.5) * 10
+        cache_key = f"{claim_text[:50]}_{source_type}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
         
-        # Bias detection
-        bias_penalty = self._detect_bias(claim_text, context)
+        base_score = self.weights.get(source_type, 0.5) * 10
+        promo = self._detect_promotional(claim_text)
+        absolute = self._detect_absolute(claim_text)
+        self_interest = self._detect_self_interest(claim_text, context)
+        evidence = self._detect_evidence(claim_text)
         
-        # Language analysis
-        language_penalty = self._analyze_language(claim_text)
+        heuristic_score = base_score - promo - absolute - self_interest + evidence
+        heuristic_score = max(0, min(10, heuristic_score))
         
-        # Context relevance
-        context_bonus = self._check_context(claim_text, context, source_type)
-        
-        # Calculate final score
-        final_score = base_score - bias_penalty - language_penalty + context_bonus
-        final_score = max(0, min(10, final_score))  # Clamp 0-10
-        
-        return round(final_score, 1)
-    
-    def _detect_bias(self, claim, context):
-        """Detect bias indicators"""
-        penalty = 0
-        
-        # Promotional language
-        promo_words = ['best', 'greatest', 'amazing', 'revolutionary', 'guaranteed']
-        for word in promo_words:
-            if word.lower() in claim.lower():
-                penalty += 1.5
-        
-        # Self-promotion context
-        if 'ceo' in context.lower() or 'founder' in context.lower():
-            if 'our' in claim.lower() or 'we' in claim.lower():
-                penalty += 2
-        
-        # Commercial context
-        if 'commercial' in context.lower() or 'advertisement' in context.lower():
-            penalty += 2.5
-        
-        return min(penalty, 5)  # Max 5 point penalty
-    
-    def _analyze_language(self, claim):
-        """Analyze claim language for credibility markers"""
-        penalty = 0
-        
-        # Absolute statements
-        absolute_words = ['always', 'never', 'every', 'all', 'none', 'perfect']
-        for word in absolute_words:
-            if re.search(r'\b' + word + r'\b', claim.lower()):
-                penalty += 0.5
-        
-        # Emotional language
-        emotional_words = ['shocking', 'unbelievable', 'incredible', 'devastating']
-        for word in emotional_words:
-            if word in claim.lower():
-                penalty += 0.5
-        
-        # Vague quantifiers
-        if re.search(r'many|some|several|few', claim.lower()):
-            penalty += 0.3
-        
-        return min(penalty, 3)  # Max 3 point penalty
-    
-    def _check_context(self, claim, context, source_type):
-        """Check if context improves credibility"""
-        bonus = 0
-        
-        # Research/study mention
-        if 'study' in claim.lower() or 'research' in claim.lower():
-            bonus += 1
-        
-        # Data/statistics
-        if re.search(r'\d+%|\d+\s*(percent|million|billion)', claim):
-            bonus += 0.5
-        
-        # Expert quote (not self-promotional)
-        if source_type in ['academic', 'news'] and 'according to' in claim.lower():
-            bonus += 1
-        
-        # Independent validation
-        if 'independent' in context.lower() or 'peer-reviewed' in context.lower():
-            bonus += 1.5
-        
-        return min(bonus, 3)  # Max 3 point bonus
-    
-    def explain_score(self, claim_text, source_type, context, score):
-        """Generate explanation for credibility score"""
-        prompt = PromptTemplate(
-            template="""Explain why this claim has credibility score {score}/10:
-
-Claim: {claim}
-Source Type: {source_type}
-Context: {context}
-
-Provide brief explanation focusing on bias, language, and source reliability.""",
-            input_variables=["claim", "source_type", "context", "score"]
+        decision = self._llm_decide_validation(
+            claim_text, source_type, context, heuristic_score,
+            promo, absolute, self_interest, evidence
         )
         
-        result = self.llm.invoke(
-            prompt.format(
-                claim=claim_text,
+        final_score = heuristic_score
+        reasoning = [f"Base score: {base_score:.1f} due to {source_type} source"]
+        if promo:
+            reasoning.append(f"Promotional penalty: -{promo:.1f} for promotional language")
+        if absolute:
+            reasoning.append(f"Absolute language penalty: -{absolute:.1f} for absolute terms")
+        if self_interest:
+            reasoning.append(f"Self-interest penalty: -{self_interest:.1f} due to self-serving context")
+        if evidence:
+            reasoning.append(f"Evidence bonus: +{evidence:.1f} for research-based evidence")
+        
+        if decision['needs_deep_analysis']:
+            reasoning.append(f"LLM analysis: {decision['reasoning']}")
+            bias_result = self._llm_bias_analysis(claim_text, context)
+            final_score += bias_result['adjustment']
+            final_score = max(0, min(10, final_score))
+            reasoning.append(f"Bias adjustment: {bias_result['adjustment']:.1f} due to {', '.join(bias_result['bias_types'])}")
+        else:
+            reasoning.append(f"LLM decision: {decision['reasoning']}")
+        
+        self.cache[cache_key] = {'score': round(final_score, 1), 'reasoning': reasoning}
+        return self.cache[cache_key]
+    
+    def _llm_decide_validation(self, claim, source_type, context, score, promo, absolute, self_interest, evidence):
+        try:
+            prompt = VALIDATION_DECISION_PROMPT.format(
+                claim=claim[:300],
                 source_type=source_type,
-                context=context,
-                score=score
+                heuristic_score=round(score, 1),
+                context=context[:200],
+                promo_penalty=promo,
+                absolute_penalty=absolute,
+                self_interest_penalty=self_interest,
+                evidence_bonus=evidence
             )
-        )
-        
-        return result.content
+            result = self.llm.invoke(prompt)
+            return json.loads(result.content)
+        except:
+            return {'needs_deep_analysis': 3.5 <= score <= 7.5, 'reasoning': 'Fallback due to parsing error', 'confidence': 5}
+    
+    def _llm_bias_analysis(self, text, context):
+        try:
+            prompt = BIAS_DETECTION_PROMPT.format(text=text[:500], context=context[:200])
+            result = self.llm.invoke(prompt)
+            analysis = json.loads(result.content)
+            return {
+                'adjustment': analysis.get('adjustment', 0),
+                'bias_types': analysis.get('bias_types', []),
+                'severity': analysis.get('severity', 'medium')
+            }
+        except:
+            return {'adjustment': 0, 'bias_types': [], 'severity': 'unknown'}
+    
+    def validate_claim(self, claim, score, evidence):
+        try:
+            prompt = CLAIM_VALIDATION_PROMPT.format(claim=claim, score=score, evidence=evidence[:1500])
+            result = self.llm.invoke(prompt)
+            validation = json.loads(result.content)
+            new_score = score + validation.get('score_adjustment', 0)
+            return {
+                'validated_score': max(0, min(10, new_score)),
+                'verdict': validation.get('verdict', 'NEUTRAL'),
+                'confidence': validation.get('confidence', 5),
+                'explanation': validation.get('explanation', 'No explanation provided')
+            }
+        except:
+            return {'validated_score': score, 'verdict': 'NEUTRAL', 'confidence': 5, 'explanation': 'Fallback validation due to error'}
+    
+    def get_final_action(self, claim, score, source_type, validation_status):
+        try:
+            prompt = FINAL_ACTION_PROMPT.format(
+                claim=claim[:200],
+                score=score,
+                source_type=source_type,
+                validation_status=validation_status
+            )
+            result = self.llm.invoke(prompt)
+            decision = json.loads(result.content)
+            return {'action': decision.get('action', self._fallback_action(score)),
+                    'reasoning': decision.get('reasoning', 'Fallback decision')}
+        except:
+            return {'action': self._fallback_action(score), 'reasoning': 'Fallback due to parsing error'}
+    
+    def _fallback_action(self, score):
+        if score >= 7.5:
+            return "INCLUDE"
+        elif score >= 4.5:
+            return "WARN"
+        return "EXCLUDE"
+    
+    def _detect_promotional(self, text):
+        patterns = [
+            r'\b(best|greatest|amazing|revolutionary|guaranteed|perfect|ultimate)\b',
+            r'\b(world.?class|industry.?leading|award.?winning)\b'
+        ]
+        penalty = sum(len(re.findall(p, text.lower())) * 1.5 for p in patterns)
+        return min(penalty, 4)
+    
+    def _detect_absolute(self, text):
+        words = ['always', 'never', 'every', 'all', 'none', 'impossible', 'guaranteed']
+        return min(sum(0.7 for w in words if w in text.lower()), 3)
+    
+    def _detect_self_interest(self, text, context):
+        penalty = 0
+        if any(r in context.lower() for r in ['ceo', 'founder', 'executive', 'sponsored']):
+            if any(r in text.lower() for r in ['our', 'we', 'us', 'my', 'i']):
+                penalty += 3.0
+        if 'commercial' in context.lower() or 'advertisement' in context.lower():
+            penalty += 3.5
+        return min(penalty, 5)
+    
+    def _detect_evidence(self, text):
+        bonus = 0
+        if re.search(r'\b(study|research|peer.?reviewed|published)\b', text.lower()):
+            bonus += 2.0
+        if re.search(r'\d+(\.\d+)?%|\d+\s*(participants|subjects|samples)', text.lower()):
+            bonus += 1.5
+        if re.search(r'(according to|expert|professor|dr\.)', text.lower()):
+            bonus += 1.0
+        if 'independent' in text.lower() or 'unbiased' in text.lower():
+            bonus += 1.5
+        return min(bonus, 4)

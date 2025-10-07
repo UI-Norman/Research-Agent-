@@ -1,0 +1,18 @@
+AI Ethics and Responsible AI Development
+
+Summary:
+This research explores the ethical challenges in artificial intelligence, including bias, accountability, transparency, and human oversight.
+
+Key Points:
+- AI systems can inherit human biases from training data.
+- Explainable AI (XAI) helps in improving transparency.
+- Ethical frameworks are essential for AI governance.
+- Human-in-the-loop systems ensure responsible decision-making.
+
+Sources:
+- Stanford Human-Centered AI Report 2023
+- OECD Principles on AI
+- EU AI Act Proposal
+
+Conclusion:
+Responsible AI design requires collaboration among technologists, policymakers, and ethicists.

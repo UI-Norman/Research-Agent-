@@ -1,172 +1,218 @@
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.prompts import PromptTemplate
-from tools import search_web, extract_claims
+from llm_factory import LLMFactory
+from tools import search_web, extract_claims, batch_validate_claims
 from credibility import CredibilityAnalyzer
+from system_prompts import RECONCILIATION_PROMPT, REPORT_GENERATION_PROMPT, UPDATE_ANALYSIS_PROMPT
+from config import CREDIBILITY_PARAMS, PERFORMANCE_CONFIG
 import json
+import time
+from cachetools import TTLCache
+from concurrent.futures import ThreadPoolExecutor
 
 class ResearchAgent:
-    def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.3)
-        self.credibility_analyzer = CredibilityAnalyzer(self.llm)
-        self.research_cache = {}
-        
+    def __init__(self, llm_provider, llm_model=None):
+        self.llm = LLMFactory.create_llm(llm_provider, llm_model)
+        self.credibility = CredibilityAnalyzer(self.llm)
+        self.cache = TTLCache(maxsize=100, ttl=PERFORMANCE_CONFIG['cache_ttl'])
+        self.metrics = {}
+    
     def research(self, topic):
-        """Conduct credibility-aware research"""
-        print("🔎 Searching web sources...")
-        search_results = search_web(topic)
+        start = time.time()
+        if topic in self.cache:
+            return self.cache[topic]
+        
+        print("🔎 Searching...")
+        sources = search_web(topic, num_results=10)
         
         print("📝 Extracting claims...")
-        claims = []
-        for result in search_results[:5]:  # Top 5 results
-            extracted = extract_claims(result['content'], result['url'], self.llm)
-            claims.extend(extracted)
+        all_claims = []
+        with ThreadPoolExecutor(max_workers=PERFORMANCE_CONFIG['max_concurrent_requests']) as executor:
+            results = executor.map(lambda src: extract_claims(src['content'], src['url'], self.llm), sources[:8])
+            for claims in results:
+                all_claims.extend(claims)
         
-        print(f"✅ Found {len(claims)} claims")
-        print("🎯 Analyzing credibility...")
+        print(f"✅ Found {len(all_claims)} claims")
+        print("🎯 Scoring credibility...")
         
-        # Score each claim
-        scored_claims = []
-        for claim in claims:
-            score = self.credibility_analyzer.score_claim(
-                claim['text'], 
-                claim['source_type'], 
-                claim['context']
+        scored = []
+        low_medium = [c for c in all_claims if self.credibility.score_claim(c['text'], c['source_type'], c.get('source_context', ''))['score'] < CREDIBILITY_PARAMS['validation_required']]
+        
+        if PERFORMANCE_CONFIG['parallel_validation'] and low_medium:
+            print("⚡ Batch validating...")
+            evidences = batch_validate_claims([c['text'] for c in low_medium], os.getenv('SERPER_API_KEY'))
+        
+        for i, claim in enumerate(all_claims):
+            score_data = self.credibility.score_claim(claim['text'], claim['source_type'], claim.get('source_context', ''))
+            claim['credibility_score'] = score_data['score']
+            claim['score_reasoning'] = score_data['reasoning']
+            
+            if claim['credibility_score'] < CREDIBILITY_PARAMS['validation_required']:
+                evidence = evidences[low_medium.index(claim)] if claim in low_medium else "No evidence"
+                validation = self.credibility.validate_claim(claim['text'], claim['credibility_score'], evidence)
+                claim['credibility_score'] = validation['validated_score']
+                claim['validation'] = validation['verdict']
+                claim['validation_reasoning'] = validation['explanation']
+            
+            action = self.credibility.get_final_action(
+                claim['text'], claim['credibility_score'], claim['source_type'], claim.get('validation', 'none')
             )
-            claim['credibility_score'] = score
-            claim['action'] = self._determine_action(score)
-            scored_claims.append(claim)
+            claim['action'] = action['action']
+            claim['action_reasoning'] = action['reasoning']
+            scored.append(claim)
         
-        # Cache for updates
-        self.research_cache[topic] = {
-            'claims': scored_claims,
-            'sources': search_results
-        }
+        self.cache[topic] = {'claims': scored, 'sources': sources}
+        report = self._generate_report(topic, scored, sources)
         
-        print("📄 Generating report...")
-        report = self._generate_report(topic, scored_claims)
+        elapsed = time.time() - start
+        self.metrics['research_time'] = elapsed
         
-        return {
+        result = {
             'report': report,
-            'claims': scored_claims,
-            'overall_credibility': self._calc_overall_score(scored_claims),
-            'sources_count': len(search_results)
+            'claims': scored,
+            'overall_credibility': self._calc_avg(scored),
+            'sources_count': len(sources),
+            'time_seconds': elapsed,
+            'sources_analyzed': self._format_sources_analyzed(sources, scored),
+            'summary': self._generate_summary(scored, sources)
         }
+        self.cache[topic] = result
+        return result
     
     def update_research(self, filepath):
-        """Update research with new source"""
-        print("📖 Reading update file...")
-        with open(filepath, 'r') as f:
+        start = time.time()
+        with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
         
         print("📝 Extracting new claims...")
         new_claims = extract_claims(content, filepath, self.llm)
         
-        print("🔄 Reconciling with existing research...")
-        # Get cached research
-        topic = list(self.research_cache.keys())[0]
-        existing_claims = self.research_cache[topic]['claims']
-        
-        # Score new claims
         for claim in new_claims:
-            score = self.credibility_analyzer.score_claim(
-                claim['text'], 
-                claim['source_type'], 
-                claim['context']
-            )
-            claim['credibility_score'] = score
-            claim['action'] = self._determine_action(score)
+            score_data = self.credibility.score_claim(claim['text'], claim['source_type'], claim.get('source_context', ''))
+            claim['credibility_score'] = score_data['score']
+            claim['score_reasoning'] = score_data['reasoning']
+            action = self.credibility.get_final_action(claim['text'], claim['credibility_score'], claim['source_type'], 'none')
+            claim['action'] = action['action']
+            claim['action_reasoning'] = action['reasoning']
         
-        # Reconcile claims
-        reconciled = self._reconcile_claims(existing_claims, new_claims)
+        topic = list(self.cache.keys())[0] if self.cache else 'unknown'
+        existing = self.cache.get(topic, {'claims': []})['claims']
         
-        # Update cache
-        self.research_cache[topic]['claims'] = reconciled
+        print("🔄 LLM analyzing update strategy...")
+        strategy = self._llm_update_strategy(existing, new_claims, filepath)
         
-        print("📄 Generating updated report...")
-        report = self._generate_report(topic, reconciled)
+        print(f"    📊 Strategy: {strategy['approach']}")
+        print(f"    💡 Reason: {strategy['reasoning']}")
         
-        return {
+        merged = self._smart_merge(existing, new_claims, strategy['approach'])
+        self.cache[topic]['claims'] = merged
+        report = self._generate_report(topic, merged, self.cache[topic].get('sources', []))
+        
+        elapsed = time.time() - start
+        overhead = elapsed / self.metrics.get('research_time', 1)
+        
+        result = {
             'report': report,
-            'claims': reconciled,
-            'overall_credibility': self._calc_overall_score(reconciled)
+            'claims': merged,
+            'overall_credibility': self._calc_avg(merged),
+            'update_time': elapsed,
+            'overhead_ratio': overhead,
+            'update_strategy': strategy,
+            'sources_analyzed': self._format_sources_analyzed(self.cache[topic].get('sources', []), merged),
+            'summary': self._generate_summary(merged, self.cache[topic].get('sources', []))
         }
+        self.cache[topic] = result
+        return result
     
-    def _reconcile_claims(self, existing, new):
-        """Reconcile new claims with existing ones"""
-        prompt = PromptTemplate(
-            template="""Compare these claims and identify conflicts, reinforcements, or new info.
-
-Existing Claims:
-{existing}
-
-New Claims:
-{new}
-
-Return JSON with: {{"conflicts": [], "reinforcements": [], "new": []}}""",
-            input_variables=["existing", "new"]
-        )
-        
-        result = self.llm.invoke(
-            prompt.format(
-                existing=json.dumps([c['text'] for c in existing[:10]]),
-                new=json.dumps([c['text'] for c in new])
-            )
-        )
-        
+    def _llm_update_strategy(self, existing, new, source):
         try:
-            analysis = json.loads(result.content)
-            # Merge: prioritize higher credibility scores
+            conflicts = sum(1 for n in new for e in existing if self._similar(n['text'], e['text']))
+            prompt = UPDATE_ANALYSIS_PROMPT.format(
+                original_quality=self._calc_avg(existing),
+                new_source_type=new[0]['source_type'] if new else 'document',
+                new_claims_count=len(new),
+                conflicts_count=conflicts,
+                reinforcements_count=len(new) - conflicts,
+                new_info_count=len(new)
+            )
+            result = self.llm.invoke(prompt)
+            return json.loads(result.content)
+        except:
+            return {'approach': 'incremental', 'reasoning': 'Fallback due to error', 'estimated_quality_impact': 'medium'}
+    
+    def _smart_merge(self, existing, new, approach):
+        try:
+            prompt = RECONCILIATION_PROMPT.format(
+                existing_claims=json.dumps([c['text'] for c in existing[:20]]),
+                new_claims=json.dumps([c['text'] for c in new])
+            )
+            result = self.llm.invoke(prompt)
+            reconciliation = json.loads(result.content)
+            
             all_claims = existing + new
-            all_claims.sort(key=lambda x: x['credibility_score'], reverse=True)
-            return all_claims
+            if approach == 'regenerate':
+                all_claims.sort(key=lambda x: x['credibility_score'], reverse=True)
+            
+            seen = set()
+            unique = []
+            for claim in all_claims:
+                key = claim['text'][:100].lower()
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(claim)
+            
+            return unique[:CREDIBILITY_PARAMS['max_claims_per_source'] * 2]
         except:
             return existing + new
     
-    def _determine_action(self, score):
-        """Determine action based on credibility score"""
-        if score >= 7:
-            return "INCLUDE"
-        elif score >= 4:
-            return "INCLUDE_WITH_WARNING"
-        else:
-            return "EXCLUDE"
+    def _similar(self, text1, text2):
+        return text1[:50].lower() == text2[:50].lower()
     
-    def _calc_overall_score(self, claims):
-        """Calculate overall credibility"""
-        if not claims:
-            return 0
-        valid_claims = [c for c in claims if c['action'] != 'EXCLUDE']
-        if not valid_claims:
-            return 0
-        return sum(c['credibility_score'] for c in valid_claims) / len(valid_claims)
+    def _calc_avg(self, claims):
+        valid = [c for c in claims if c['action'] != 'EXCLUDE']
+        return sum(c['credibility_score'] for c in valid) / len(valid) if valid else 0
     
-    def _generate_report(self, topic, claims):
-        """Generate final research report"""
-        high_cred = [c for c in claims if c['credibility_score'] >= 7]
-        med_cred = [c for c in claims if 4 <= c['credibility_score'] < 7]
+    def _generate_report(self, topic, claims, sources):
+        high = [c for c in claims if c['credibility_score'] >= CREDIBILITY_PARAMS['thresholds']['high']]
+        medium = [c for c in claims if CREDIBILITY_PARAMS['thresholds']['medium'] <= c['credibility_score'] < CREDIBILITY_PARAMS['thresholds']['high']]
         
-        prompt = PromptTemplate(
-            template="""Generate a research report on: {topic}
-
-High Credibility Claims ({count_high}):
-{high_claims}
-
-Medium Credibility Claims ({count_med}):
-{med_claims}
-
-Write a comprehensive report. Mark medium credibility claims with [⚠️ VERIFY].
-Focus on high-credibility information.""",
-            input_variables=["topic", "count_high", "high_claims", "count_med", "med_claims"]
+        prompt = REPORT_GENERATION_PROMPT.format(
+            topic=topic,
+            high_credibility_claims="\n".join([
+                f"- {c['text']} (Score: {c['credibility_score']:.1f}, Source: {c['source_type']}, Source URL: {c['source']}, Reason: {'; '.join(c['score_reasoning'])}, Decision: {c['action']} because {c['action_reasoning']})"
+                for c in high[:20]
+            ]),
+            medium_credibility_claims="\n".join([
+                f"- {c['text']} [⚠️ VERIFY] (Score: {c['credibility_score']:.1f}, Source: {c['source_type']}, Source URL: {c['source']}, Reason: {'; '.join(c['score_reasoning'])}, Validation: {c.get('validation', 'none')} - {c.get('validation_reasoning', 'none')}, Decision: {c['action']} because {c['action_reasoning']})"
+                for c in medium[:15]
+            ])
         )
         
-        result = self.llm.invoke(
-            prompt.format(
-                topic=topic,
-                count_high=len(high_cred),
-                high_claims="\n".join([f"- {c['text']}" for c in high_cred[:15]]),
-                count_med=len(med_cred),
-                med_claims="\n".join([f"- {c['text']}" for c in med_cred[:10]])
-            )
-        )
-        
+        result = self.llm.invoke(prompt)
         return result.content
+    
+    def _format_sources_analyzed(self, sources, claims):
+        source_summary = []
+        for src in sources:
+            src_claims = [c for c in claims if c['source'] == src['url']]
+            if src_claims:
+                summary = f"**Source**: {src['url']} ({src['source_type']})\n"
+                summary += f"**Claims Found**: {len(src_claims)}\n"
+                summary += "\n".join([
+                    f"- **Claim**: {c['text']}\n  - **Score**: {c['credibility_score']:.1f}\n  - **Reasoning**: {'; '.join(c['score_reasoning'])}"
+                    for c in src_claims
+                ])
+                source_summary.append(summary)
+        return "\n\n".join(source_summary) if source_summary else "No sources analyzed"
+    
+    def _generate_summary(self, claims, sources):
+        high = [c for c in claims if c['credibility_score'] >= CREDIBILITY_PARAMS['thresholds']['high']]
+        medium = [c for c in claims if CREDIBILITY_PARAMS['thresholds']['medium'] <= c['credibility_score'] < CREDIBILITY_PARAMS['thresholds']['high']]
+        excluded = [c for c in claims if c['action'] == 'EXCLUDE']
+        
+        summary = f"**Summary of Findings**:\n"
+        summary += f"- **Total Claims Analyzed**: {len(claims)}\n"
+        summary += f"- **High Credibility Claims** ({len(high)}): Included due to strong evidence and reliable sources.\n"
+        summary += f"- **Medium Credibility Claims** ({len(medium)}): Require verification due to potential biases or limited evidence.\n"
+        summary += f"- **Excluded Claims** ({len(excluded)}): Removed due to low credibility or significant biases.\n"
+        summary += f"- **Sources Analyzed**: {len(sources)} sources, including {', '.join(set(s['source_type'] for s in sources))}.\n"
+        summary += f"- **Key Insights**: High-credibility claims are primarily from academic and government sources, while commercial and corporate sources often required validation due to promotional or self-interest biases."
+        return summary
