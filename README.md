@@ -1,4 +1,4 @@
-# Credibility-Aware Research Agent 
+# Credibility-Aware Research Agent for RND 
 
 ## 📋 System Overview
 
